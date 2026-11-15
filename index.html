@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="description" content="Interactive, GPU-accelerated Koch snowflake explorer." />
+    <meta name="theme-color" content="#0b0d12" />
+    <title>Koch Snowflake</title>
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='-1.1 -1.1 2.2 2.2'><path fill='none' stroke='%237dd3fc' stroke-width='.12' stroke-linejoin='round' d='M0-1 .29-.5H.87L.58 0 .87.5H.29L0 1-.29.5H-.87L-.58 0-.87-.5H-.29Z'/></svg>" />
+  </head>
+  <body>
+    <canvas id="gl" aria-label="Koch snowflake rendering"></canvas>
+
+    <aside id="panel">
+      <header>
+        <h1>Koch&nbsp;Snowflake</h1>
+        <button id="toggle-panel" type="button" aria-label="Collapse panel" title="Collapse panel">
+          <svg viewBox="0 0 16 16" width="14" height="14"><path d="M4 6l4 4 4-4" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        </button>
+      </header>
+      <div id="panel-body"></div>
+      <footer>
+        <kbd>Space</kbd> animate · <kbd>↑</kbd><kbd>↓</kbd> depth · <kbd>F</kbd> fit · <kbd>H</kbd> hide UI · scroll/pinch to zoom
+      </footer>
+    </aside>
+
+    <div id="hud" aria-live="off"></div>
+    <div id="toast" role="status"></div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
