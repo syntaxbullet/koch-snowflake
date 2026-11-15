@@ -278,6 +278,25 @@ function distSeg(px: number, py: number, bx: number, by: number, ax: number, ay:
   return Math.hypot(px - bx - ax * t, py - by - ay * t);
 }
 
+/** Re-express a level-0 frame as seed side j (same screen mapping). */
+export function toSeedSide(sh: Shape, f: Frame, j: number) {
+  const k0 = f.addr[0];
+  if (j === k0) return;
+  const den = sh.sx[k0] ** 2 + sh.sy[k0] ** 2;
+  // A_j = A·(s_j/s_k0), B_j = B + A·((v_j - v_k0)/s_k0)
+  const rr = (sh.sx[j] * sh.sx[k0] + sh.sy[j] * sh.sy[k0]) / den;
+  const ri = (sh.sy[j] * sh.sx[k0] - sh.sx[j] * sh.sy[k0]) / den;
+  const dx = sh.vx[j] - sh.vx[k0], dy = sh.vy[j] - sh.vy[k0];
+  const pr = (dx * sh.sx[k0] + dy * sh.sy[k0]) / den;
+  const pi = (dy * sh.sx[k0] - dx * sh.sy[k0]) / den;
+  const ar = f.ar * rr - f.ai * ri, ai = f.ar * ri + f.ai * rr;
+  f.br += f.ar * pr - f.ai * pi;
+  f.bi += f.ar * pi + f.ai * pr;
+  f.ar = ar;
+  f.ai = ai;
+  f.addr[0] = j;
+}
+
 /** Camera for the seed side 0 given a world→screen similarity (m·(z - c) + off). */
 export function seedFrame(sh: Shape, mr: number, mi: number, cx: number, cy: number, ox: number, oy: number): Frame {
   const dx = sh.vx[0] - cx, dy = sh.vy[0] - cy;
@@ -290,47 +309,91 @@ export function seedFrame(sh: Shape, mr: number, mi: number, cx: number, cy: num
   };
 }
 
-/** Keep the camera segment screen-sized and near the view centre. */
-export function normalize(sh: Shape, f: Frame, vcx: number, vcy: number, diag: number) {
-  const hi = 2 * diag;
-  for (let it = 0; it < 400; it++) {
-    const len = Math.hypot(f.ar, f.ai);
-    if (len > hi) {
-      let best = 0, bd = Infinity;
-      for (let j = 0; j < 4; j++) {
-        sh.child(j, f.addr.length, 1, tmp);
-        const bx = f.br + f.ar * tmp[0] - f.ai * tmp[1];
-        const by = f.bi + f.ar * tmp[1] + f.ai * tmp[0];
-        const ax = f.ar * tmp[2] - f.ai * tmp[3];
-        const ay = f.ar * tmp[3] + f.ai * tmp[2];
-        const d = distSeg(vcx, vcy, bx, by, ax, ay);
-        if (d < bd) { bd = d; best = j; }
-      }
-      descend(sh, f, best);
+/**
+ * Branch-and-bound search for the curve segment nearest to (vx, vy), refined
+ * until segments are at most `hi` px long. Subtrees are ranked by a guaranteed
+ * lower bound on their distance (disc of radius |A|·rho around the midpoint)
+ * and pruned once they cannot beat the best leaf found so far. Unlike a greedy
+ * "closest chord" descent this cannot wander off into the wrong branch.
+ */
+function nearestLeaf(sh: Shape, roots: Frame[], vx: number, vy: number, hi: number): Frame | null {
+  const lb = (f: Frame) => Math.hypot(vx - f.br - f.ar / 2, vy - f.bi - f.ai / 2) - Math.hypot(f.ar, f.ai) * sh.rho;
+  let best: Frame | null = null, bd = Infinity;
+  const stack = roots.map(cloneFrame).sort((a, b) => lb(b) - lb(a));
+  for (let it = 0; it < 20000 && stack.length; it++) {
+    const f = stack.pop()!;
+    if (lb(f) >= bd) continue;
+    if (Math.hypot(f.ar, f.ai) <= hi) {
+      const d = distSeg(vx, vy, f.br, f.bi, f.ar, f.ai);
+      if (d < bd) { bd = d; best = f; }
       continue;
     }
-    if (f.addr.length > 1) {
-      sh.child(f.addr[f.addr.length - 1], f.addr.length - 1, 1, tmp);
-      if (len / Math.hypot(tmp[2], tmp[3]) < hi / 2) {
-        ascend(sh, f);
-        continue;
-      }
+    const kids: Frame[] = [];
+    for (let j = 0; j < 4; j++) {
+      const g = cloneFrame(f);
+      descend(sh, g, j);
+      kids.push(g);
     }
-    const d0 = distSeg(vcx, vcy, f.br, f.bi, f.ar, f.ai);
-    if (d0 > 2 * diag) {
-      let moved = false;
-      for (const dir of [1, -1] as const) {
-        const g = cloneFrame(f);
-        if (step(sh, g, dir) && distSeg(vcx, vcy, g.br, g.bi, g.ar, g.ai) < d0) {
-          Object.assign(f, g);
-          moved = true;
-          break;
-        }
-      }
-      if (moved) continue;
-    }
-    break;
+    kids.sort((a, b) => lb(b) - lb(a)); // nearest ends up on top of the stack
+    stack.push(...kids);
   }
+  return best;
+}
+
+/**
+ * The segment plus up to n neighbours either side along the curve (all seed sides at
+ * level 0). Points close in space can sit in adjacent branches of the tree, so
+ * nearest-point searches must start from a neighbourhood, not a single subtree.
+ */
+function neighbourhood(sh: Shape, f: Frame, n: number): Frame[] {
+  if (f.addr.length === 1 && sh.closed) {
+    const out: Frame[] = [];
+    for (let j = 0; j < sh.nSeed; j++) {
+      const g = cloneFrame(f);
+      toSeedSide(sh, g, j);
+      out.push(g);
+    }
+    return out;
+  }
+  const out = [cloneFrame(f)];
+  for (const dir of [1, -1] as const) {
+    let g = f;
+    for (let k = 0; k < n; k++) {
+      const h = cloneFrame(g);
+      if (!step(sh, h, dir)) break;
+      out.push(h);
+      g = h;
+    }
+  }
+  return out;
+}
+
+/**
+ * Keep the camera segment screen-sized and as close as possible to the view
+ * centre. Only ever climbs as high as needed, so numbers stay small (precision).
+ */
+export function normalize(sh: Shape, f: Frame, vcx: number, vcy: number, diag: number) {
+  const hi = 2 * diag;
+  const set = (g: Frame | null) => { if (g) Object.assign(f, g); };
+
+  // too small: climb until the parent would be too small to split again
+  for (let it = 0; it < 4000 && f.addr.length > 1; it++) {
+    sh.child(f.addr[f.addr.length - 1], f.addr.length - 1, 1, tmp);
+    if (Math.hypot(f.ar, f.ai) / Math.hypot(tmp[2], tmp[3]) >= hi / 2) break;
+    ascend(sh, f);
+  }
+
+  // drifted away from the view centre (zooming around the cursor / fingers):
+  // climb until the ancestor is big enough to reach back, then search it
+  const d0 = distSeg(vcx, vcy, f.br, f.bi, f.ar, f.ai);
+  if (d0 > diag / 2) {
+    while (f.addr.length > 1 && Math.hypot(f.ar, f.ai) < 4 * d0) ascend(sh, f);
+    set(nearestLeaf(sh, neighbourhood(sh, f, 3), vcx, vcy, hi));
+    return;
+  }
+
+  // too big: refine to the nearest sub-segment (neighbours included: branches interleave)
+  if (Math.hypot(f.ar, f.ai) > hi) set(nearestLeaf(sh, neighbourhood(sh, f, 1), vcx, vcy, hi));
 }
 
 // ─────────────────────────── builder ───────────────────────────
@@ -401,22 +464,10 @@ export class Builder {
     let u0: number, du: number;
     if (levelOf(root) === 0) {
       whole = true;
-      const k0 = root.addr[0];
-      const den = sh.sx[k0] ** 2 + sh.sy[k0] ** 2;
       for (let j = 0; j < sh.nSeed; j++) {
-        // A_j = A·(s_j/s_k0), B_j = B + A·((v_j - v_k0)/s_k0)
-        const rr = (sh.sx[j] * sh.sx[k0] + sh.sy[j] * sh.sy[k0]) / den;
-        const ri = (sh.sy[j] * sh.sx[k0] - sh.sx[j] * sh.sy[k0]) / den;
-        const dx = sh.vx[j] - sh.vx[k0], dy = sh.vy[j] - sh.vy[k0];
-        const pr = (dx * sh.sx[k0] + dy * sh.sy[k0]) / den;
-        const pi = (dy * sh.sx[k0] - dx * sh.sy[k0]) / den;
-        chain.push({
-          addr: [j],
-          ar: root.ar * rr - root.ai * ri,
-          ai: root.ar * ri + root.ai * rr,
-          br: root.br + root.ar * pr - root.ai * pi,
-          bi: root.bi + root.ar * pi + root.ai * pr,
-        });
+        const g = cloneFrame(root);
+        toSeedSide(sh, g, j);
+        chain.push(g);
       }
       u0 = 0;
       du = 1 / sh.nSeed;
@@ -424,13 +475,15 @@ export class Builder {
       chain.push(root);
       for (const dir of [1, -1] as const) {
         let f = root;
-        for (let n = 0; n < 64; n++) {
+        // walk until a couple of consecutive segments are off-screen (tolerates folds)
+        let misses = 0;
+        for (let n = 0; n < 64 && misses < 3; n++) {
           const g = cloneFrame(f);
           if (!step(sh, g, dir)) break;
           if (dir > 0) chain.push(g);
           else chain.unshift(g);
           f = g;
-          if (!visible(g, diag)) break;
+          misses = visible(g, diag) ? 0 : misses + 1;
         }
       }
       // global path parameter of the first chain segment
@@ -627,4 +680,21 @@ function clipPoly(p: number[], cw: number, ch: number): number[] {
     }
   }
   return out;
+}
+
+/** Nearest point on the emitted segments to (x, y) (device px). Returns [x, y, distance]. */
+export function nearestOnSegments(seg: Float32Array, count: number, x: number, y: number): [number, number, number] | null {
+  let bd = Infinity, bx = 0, by = 0;
+  for (let i = 0; i < count; i++) {
+    const o = i * 8;
+    const ax = seg[o], ay = seg[o + 1];
+    const dx = seg[o + 2] - ax, dy = seg[o + 3] - ay;
+    const l2 = dx * dx + dy * dy;
+    let t = l2 > 0 ? ((x - ax) * dx + (y - ay) * dy) / l2 : 0;
+    t = t < 0 ? 0 : t > 1 ? 1 : t;
+    const px = ax + dx * t, py = ay + dy * t;
+    const d = (px - x) ** 2 + (py - y) ** 2;
+    if (d < bd) { bd = d; bx = px; by = py; }
+  }
+  return bd < Infinity ? [bx, by, Math.sqrt(bd)] : null;
 }

@@ -1,7 +1,7 @@
 import './style.css';
 import { Renderer } from './renderer';
 import { Panel } from './ui';
-import { Shape, Builder, normalize, seedFrame, type Frame, type BuildResult } from './fractal';
+import { Shape, Builder, normalize, seedFrame, nearestOnSegments, type Frame, type BuildResult } from './fractal';
 import { defaults, presets, fromHash, toHash, equalWidth, GEOM_KEYS, DEPTH_MAX, type Key, type Settings } from './settings';
 
 // ───────────────────────────── state ─────────────────────────────
@@ -120,6 +120,27 @@ const zoomAt = (x: number, y: number, f: number) => transform(f, 0, x, y, x, y);
 const pan = (dx: number, dy: number) => transform(1, 0, 0, 0, dx, dy);
 const rotateAbout = (x: number, y: number, a: number) => transform(Math.cos(a), Math.sin(a), x, y, x, y);
 
+/**
+ * Magnetic zoom. The curve is infinitely thin, so zooming into any point not
+ * exactly on it eventually shows only empty space. When zooming in near the
+ * curve, use the nearest curve point as the zoom centre instead (re-snapped every
+ * step, so the error never accumulates).
+ */
+function snapToCurve(x: number, y: number): { x: number; y: number } {
+  if (!s.follow) return { x, y };
+  if (geomDirty) {
+    rebuild();
+    geomDirty = false;
+    dirty = true;
+  }
+  if (!built) return { x, y };
+  const dpr = dprNow();
+  const hit = nearestOnSegments(built.seg, built.segCount, x * dpr, y * dpr);
+  const radius = Math.max(40, 0.15 * Math.min(canvas.clientWidth, canvas.clientHeight));
+  if (!hit || hit[2] / dpr > radius) return { x, y };
+  return { x: hit[0] / dpr, y: hit[1] / dpr };
+}
+
 function iterLevel() {
   if (s.infinite) return { L: Infinity, t: 1 };
   const L = Math.min(DEPTH_MAX, Math.max(0, Math.ceil(s.depth - 1e-9)));
@@ -170,7 +191,7 @@ panel.color(st, 'Background', 'bg');
 
 const vw = panel.section('View');
 panel.slider(vw, 'Auto zoom', 'autoZoom', -2, 3, 0.05, (v) => (v === 0 ? 'off' : `×${(2 ** v).toFixed(2)}/s`), 'Continuously zoom toward the view centre');
-panel.toggle(vw, 'Follow curve', 'follow', 'While auto-zooming, steer toward the nearest point on the curve');
+panel.toggle(vw, 'Stick to curve', 'follow', 'Zooming in (scroll, pinch, auto zoom) centres on the nearest point of the curve, so it never drifts off-screen');
 panel.slider(vw, 'Rotation', 'rotation', -180, 180, 0.5, deg);
 panel.slider(vw, 'Spin', 'spin', -90, 90, 1, (v) => `${v.toFixed(0)}°/s`);
 panel.slider(vw, 'Detail cutoff', 'lod', 0.1, 8, 0.05, (v) => `${v.toFixed(2)}px`,
@@ -265,13 +286,17 @@ canvas.addEventListener('wheel', (e) => {
   const p = rel(e);
   const delta = e.deltaMode === 1 ? e.deltaY * 16 : e.deltaY;
   // ctrlKey = trackpad pinch on desktop browsers
-  zoomAt(p.x, p.y, Math.exp(-delta * (e.ctrlKey ? 0.01 : 0.0015)));
+  const f = Math.exp(-delta * (e.ctrlKey ? 0.01 : 0.0015));
+  const c = f > 1 ? snapToCurve(p.x, p.y) : p;
+  zoomAt(c.x, c.y, f);
 }, { passive: false });
 
 const pointers = new Map<number, { x: number; y: number }>();
 /** Two-finger gesture state: rotation only engages after a deliberate twist. */
 let gesture: { twist: number; rotating: boolean } | null = null;
+/** Double-tap = two genuine taps (short, single finger, barely moved) close together. */
 let lastTap = { t: 0, x: 0, y: 0 };
+let tap: { id: number; t: number; x: number; y: number } | null = null;
 const ROTATE_THRESHOLD = 12 * DEG;
 
 canvas.addEventListener('pointerdown', (e) => {
@@ -284,13 +309,7 @@ canvas.addEventListener('pointerdown', (e) => {
   pointers.set(e.pointerId, p);
   canvas.classList.add('dragging');
   if (pointers.size === 2) gesture = { twist: 0, rotating: false };
-  if (e.pointerType === 'touch' && pointers.size === 1) {
-    const now = performance.now();
-    if (now - lastTap.t < 300 && Math.hypot(p.x - lastTap.x, p.y - lastTap.y) < 30) {
-      fit();
-      lastTap.t = 0;
-    } else lastTap = { t: now, x: p.x, y: p.y };
-  }
+  tap = e.pointerType === 'touch' && pointers.size === 1 ? { id: e.pointerId, t: performance.now(), x: p.x, y: p.y } : null;
 });
 
 canvas.addEventListener('pointermove', (e) => {
@@ -298,6 +317,7 @@ canvas.addEventListener('pointermove', (e) => {
   if (!prev) return;
   const p = rel(e);
   pointers.set(e.pointerId, p);
+  if (tap && Math.hypot(p.x - tap.x, p.y - tap.y) > 10) tap = null;
   if (pointers.size === 1) {
     if (e.shiftKey) {
       // shift-drag rotates around the view centre
@@ -321,15 +341,24 @@ canvas.addEventListener('pointermove', (e) => {
       gesture.twist += Math.atan2(ki, kr);
       if (Math.abs(gesture.twist) > ROTATE_THRESHOLD) gesture.rotating = true;
     }
-    if (gesture.rotating) {
-      transform(kr, ki, prev.x, prev.y, p.x, p.y);
-    } else {
-      // scale + pan only, around the finger midpoint
-      transform(Math.hypot(kr, ki), 0, (prev.x + other.x) / 2, (prev.y + other.y) / 2, (p.x + other.x) / 2, (p.y + other.y) / 2);
-    }
+    // pivot = finger midpoint (snapped to the curve when zooming in); content pans with the midpoint
+    const mox = (prev.x + other.x) / 2, moy = (prev.y + other.y) / 2;
+    const tx = (p.x + other.x) / 2 - mox, ty = (p.y + other.y) / 2 - moy;
+    const mag = Math.hypot(kr, ki);
+    const c = mag > 1 ? snapToCurve(mox, moy) : { x: mox, y: moy };
+    if (gesture.rotating) transform(kr, ki, c.x, c.y, c.x + tx, c.y + ty);
+    else transform(mag, 0, c.x, c.y, c.x + tx, c.y + ty);
   }
 });
 const endPointer = (e: PointerEvent) => {
+  const now = performance.now();
+  if (e.type === 'pointerup' && tap && tap.id === e.pointerId && pointers.size === 1 && now - tap.t < 250) {
+    if (now - lastTap.t < 350 && Math.hypot(tap.x - lastTap.x, tap.y - lastTap.y) < 30) {
+      fit();
+      lastTap.t = 0;
+    } else lastTap = { t: now, x: tap.x, y: tap.y };
+  }
+  if (pointers.size > 1 || (tap && tap.id === e.pointerId)) tap = null;
   pointers.delete(e.pointerId);
   if (pointers.size < 2) gesture = null;
   if (!pointers.size) canvas.classList.remove('dragging');
@@ -357,7 +386,7 @@ window.addEventListener('keydown', (e) => {
     case 'f': case 'F': fit(); return;
     case 'h': case 'H': document.body.classList.toggle('ui-hidden'); return;
     case 'p': case 'P': exportPNG(); return;
-    case '+': case '=': zoomAt(vcx, vcy, 1.25); return;
+    case '+': case '=': { const c = snapToCurve(vcx, vcy); zoomAt(c.x, c.y, 1.25); return; }
     case '-': case '_': zoomAt(vcx, vcy, 0.8); return;
     default: return;
   }
@@ -593,6 +622,6 @@ requestAnimationFrame(tick);
 // Dev-only hook for automated testing (stripped from production builds).
 if (import.meta.env.DEV) {
   Object.assign(window, {
-    __koch: { zoomAt, pan, fit, viewArea, get built() { return built; }, get cam() { return cam; }, get logZoom() { return logZoom; }, draw },
+    __koch: { zoomAt, pan, fit, snapToCurve, viewArea, get built() { return built; }, get cam() { return cam; }, get logZoom() { return logZoom; }, draw },
   });
 }
