@@ -1,15 +1,17 @@
 # Koch Snowflake
 
-An interactive, GPU-accelerated Koch snowflake explorer. Zero runtime dependencies. It builds to a few static files you can host anywhere.
+An interactive, GPU-accelerated Koch snowflake explorer with **true infinite zoom**. Zero runtime dependencies. It builds to a few static files you can host anywhere.
+
+Live: https://syntaxbullet.github.io/koch-snowflake/
 
 ## Features
 
-- **Smooth iteration morphing.** Depth is continuous, so new spikes grow out of the previous level. The morph runs entirely on the GPU, which makes scrubbing free.
+- **Infinite zoom.** Turn on *Infinite depth* and keep zooming with no limit. It has been tested past 10⁷⁰×, where it shows level 150+ of the fractal at full precision. *Fly in ∞* turns on auto-zoom, which steers along the curve as it goes.
+- **Smooth iteration morphing.** With a finite depth, the depth value is continuous, so new spikes grow out of the previous level.
 - **Generalised Koch rule.** You can change the seed polygon (1–12 sides, where 1 is the Koch curve), the spike angle (negative angles point inward, giving the anti-snowflake), the spike width, an "equal segments" Cesàro mode, the apex skew, and alternating direction per level.
-- **Up to ~4.2 M vertices.** That's depth 10 for the classic snowflake.
-- **Styling.** Solid, gradient or rainbow strokes with any line width, animated colour flow, an additive glow mode, and a solid or radial even-odd fill.
-- **View controls.** Drag to pan, scroll or pinch to zoom around the cursor, plus rotation and auto-spin.
-- **Export.** Save a PNG of the current view or an SVG of the whole shape, or copy a shareable link. All settings live in the URL hash.
+- **Styling.** Solid, gradient or rainbow strokes, coloured by position along the path or by segment direction. Direction colouring looks the same at every zoom level. Also: any line width, animated colour flow, an additive glow mode, and a solid or radial even-odd fill.
+- **Touch and mouse.** Drag to pan and scroll to zoom around the cursor. On touch screens, pinch to zoom, use two fingers to pan, twist to rotate, and double-tap to fit. Rotation only engages after a deliberate twist of more than 12°, so zooming never rotates by accident. On desktop, Shift-drag rotates and a trackpad pinch zooms.
+- **Export.** Save a PNG or a vector SVG of the current view, or copy a shareable link. All settings live in the URL hash.
 - **Presets:** Classic, Anti, Koch curve, Cesàro, Quadric, Thorns, Wave, Swirl.
 
 ### Keyboard
@@ -18,23 +20,38 @@ An interactive, GPU-accelerated Koch snowflake explorer. Zero runtime dependenci
 | --- | --- |
 | `Space` | Animate depth (ping-pong) |
 | `↑` / `↓` or `]` / `[` | Next / previous iteration |
+| `I` | Toggle infinite depth |
 | `F` or double-click | Fit view |
 | `H` | Hide UI |
 | `P` | Save PNG |
 | `+` / `-` | Zoom |
 
-## How it's fast
+## How it works
 
-Depth 10 has 3.1 M segments. A full-screen frame of it renders in **~0.6 ms**. The fill costs 1.5 ms even when all 3.1 M segments are forced through.
+### Infinite zoom without running out of precision
+
+Plain floating-point numbers run out of precision at around 10⁷× zoom. So the camera isn't stored as a position in space. It's stored as an **address in the subdivision tree**: the seed side, then which of the four children at each level (`[side, d₁, d₂, …]`). Alongside the address is a mapping from that segment to the screen, `screen(z) = A·z + B`, using complex numbers.
+
+The camera is kept *normalised*: it always points at a segment roughly the size of the screen near the view centre.
+
+- **Zooming in** moves the camera down to a child segment.
+- **Zooming out** moves it up to the parent.
+- **Panning** along the curve steps to the next or previous segment at the same level, using exact ratios between neighbouring segments.
+
+The numbers involved stay screen-sized no matter how deep you go, so zoom has no limit (`src/fractal.ts`).
+
+### Only the visible part is built
+
+Each time the view changes, the builder goes up from the camera to a segment that covers the screen and collects its neighbours along the curve. It then subdivides, skipping anything off-screen and stopping once segments are about a pixel long (*Detail cutoff*). A typical view has 10–30 K segments and builds in 1–8 ms, whatever the zoom or depth.
+
+### Rendering
 
 | Piece | Technique |
 | --- | --- |
-| Geometry | Built iteratively in a **Web Worker** using Float64 maths, then output as Float32 and *transferred* back with no copy. Requests are coalesced, so dragging a slider never queues stale work. |
-| Vertex pulling | All points live in one RGBA32F texture holding `[x, y, baseX, baseY]` for each point. The shaders derive everything from `gl_VertexID`, so there are no vertex or index buffers. |
-| Level of detail | Level-k vertices sit at stride 4^(L−k) in the final data. Any coarser iteration can therefore be drawn from the same texture, and the renderer stops at the level where segments drop below ~1 px on screen. Zooming in reveals deeper levels automatically. You can tune this with the *Detail cutoff* setting. |
-| Morphing | Each vertex stores its final position and its "base" position, the spot it occupies before the newest spike grows. The shader lerps between them, so fractional depth costs no CPU work. |
-| Strokes | Each segment becomes a quad, and the fragment shader computes the distance to the segment. This gives anti-aliased lines of any width with round joins. |
-| Fill | **Even-odd stencil fill without slivers.** The parity of the level-n curve equals the seed polygon XOR every spike triangle of every level. The renderer stencil-inverts those small, local triangles (indices are computed in the shader) instead of a triangle fan of millions of slivers, which is about 200× faster. One full-screen pass then shades the result. |
+| Strokes | Segments live in a float texture. The shader reads each one by vertex index (`gl_VertexID`) and expands it into a quad, so there are no vertex buffers. The fragment shader computes the distance to the segment, which gives anti-aliased lines of any width with round joins. |
+| Fill | **Even-odd stencil fill without slivers.** Whether a point is inside the level-n curve can be worked out as: the seed polygon XOR every spike triangle of every level. So the builder emits small local triangles, and the stencil buffer does the XOR. When zoomed deep, the levels above the visible part become a single polygon closed off far away on the curve's interior side. |
+| Morphing | The newest level's spike tips are blended between flat and fully grown, which gives smooth fractional depth. |
+| Precision | Anything far off-screen is clipped in 64-bit maths before being converted to 32-bit floats for the GPU. |
 | Frame loop | Draws only when something changed or is animating. |
 
 ## Develop

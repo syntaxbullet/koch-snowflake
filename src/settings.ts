@@ -8,6 +8,7 @@ export const defaults = {
   equal: false,
   // iteration
   depth: 4,
+  infinite: false,
   play: false,
   playSpeed: 0.6,
   playTo: 6,
@@ -15,6 +16,7 @@ export const defaults = {
   stroke: true,
   lineWidth: 1.25,
   colorMode: 1 as 0 | 1 | 2,
+  colorBy: 0 as 0 | 1,
   color1: '#7dd3fc',
   color2: '#c4b5fd',
   cycles: 1,
@@ -30,6 +32,8 @@ export const defaults = {
   bg: '#0b0d12',
   rotation: 0,
   spin: 0,
+  autoZoom: 0,
+  follow: true,
   lod: 0.75,
 };
 
@@ -45,11 +49,8 @@ export function equalWidth(angleDeg: number) {
   return c / (1 + c);
 }
 
-/** Maximum vertex budget. ~4.2M points ≈ 67 MB of GPU memory. */
-export const MAX_POINTS = 4_200_000;
-export function maxDepth(sides: number) {
-  return Math.floor(Math.log(MAX_POINTS / Math.max(1, sides)) / Math.log(4));
-}
+/** Max finite iteration depth (geometry is generated per view, so this is cheap). */
+export const DEPTH_MAX = 12;
 
 export const presets: Record<string, Partial<Settings>> = {
   Classic: { sides: 3, angle: 60, width: 1 / 3, skew: 0, alternate: false, equal: false },
