@@ -122,23 +122,41 @@ const rotateAbout = (x: number, y: number, a: number) => transform(Math.cos(a), 
 
 /**
  * Magnetic zoom. The curve is infinitely thin, so zooming into any point not
- * exactly on it eventually shows only empty space. When zooming in near the
- * curve, use the nearest curve point as the zoom centre instead (re-snapped every
- * step, so the error never accumulates).
+ * exactly on it eventually shows only empty space. When zooming in by `f`, pivot
+ * on the curve point nearest to (x, y) instead (re-snapped every step, so the
+ * error never accumulates). Returns the pivot and where it should end up: a
+ * pivot that is off-screen is also pulled toward (x, y), so zooming in always
+ * brings the curve back into view.
  */
-function snapToCurve(x: number, y: number): { x: number; y: number } {
-  if (!s.follow) return { x, y };
+function zoomPivot(x: number, y: number, f: number): { x: number; y: number; qx: number; qy: number } {
+  if (!s.follow) return { x, y, qx: x, qy: y };
   if (geomDirty) {
     rebuild();
     geomDirty = false;
     dirty = true;
   }
-  if (!built) return { x, y };
   const dpr = dprNow();
-  const hit = nearestOnSegments(built.seg, built.segCount, x * dpr, y * dpr);
-  const radius = Math.max(40, 0.15 * Math.min(canvas.clientWidth, canvas.clientHeight));
-  if (!hit || hit[2] / dpr > radius) return { x, y };
-  return { x: hit[0] / dpr, y: hit[1] / dpr };
+  const hit = built && nearestOnSegments(built.seg, built.segCount, x * dpr, y * dpr);
+  let px: number, py: number;
+  if (hit) {
+    px = hit[0] / dpr;
+    py = hit[1] / dpr;
+  } else {
+    // nothing drawn: the camera segment still tracks the nearest part of the curve
+    const l2 = cam.ar * cam.ar + cam.ai * cam.ai;
+    const t = l2 > 0 ? Math.min(1, Math.max(0, ((x - cam.br) * cam.ar + (y - cam.bi) * cam.ai) / l2)) : 0;
+    px = cam.br + cam.ar * t;
+    py = cam.bi + cam.ai * t;
+  }
+  if (!Number.isFinite(px + py)) return { x, y, qx: x, qy: y };
+  const inView = Math.abs(px) <= canvas.clientWidth / 2 && Math.abs(py) <= canvas.clientHeight / 2;
+  const pull = inView || !(f > 1) ? 0 : 1 - 1 / f;
+  return { x: px, y: py, qx: px + (x - px) * pull, qy: py + (y - py) * pull };
+}
+/** Zoom in by f around the curve point nearest to (x, y), optionally panning by (tx, ty) and rotating. */
+function zoomInAt(x: number, y: number, kr: number, ki = 0, tx = 0, ty = 0) {
+  const c = zoomPivot(x, y, Math.hypot(kr, ki));
+  transform(kr, ki, c.x, c.y, c.qx + tx, c.qy + ty);
 }
 
 function iterLevel() {
@@ -191,7 +209,7 @@ panel.color(st, 'Background', 'bg');
 
 const vw = panel.section('View');
 panel.slider(vw, 'Auto zoom', 'autoZoom', -2, 3, 0.05, (v) => (v === 0 ? 'off' : `×${(2 ** v).toFixed(2)}/s`), 'Continuously zoom toward the view centre');
-panel.toggle(vw, 'Stick to curve', 'follow', 'Zooming in (scroll, pinch, auto zoom) centres on the nearest point of the curve, so it never drifts off-screen');
+panel.toggle(vw, 'Stick to curve', 'follow', 'Zooming in (scroll, pinch, auto zoom) centres on the nearest point of the curve, and pulls it back into view if it is off-screen');
 panel.slider(vw, 'Rotation', 'rotation', -180, 180, 0.5, deg);
 panel.slider(vw, 'Spin', 'spin', -90, 90, 1, (v) => `${v.toFixed(0)}°/s`);
 panel.slider(vw, 'Detail cutoff', 'lod', 0.1, 8, 0.05, (v) => `${v.toFixed(2)}px`,
@@ -287,8 +305,8 @@ canvas.addEventListener('wheel', (e) => {
   const delta = e.deltaMode === 1 ? e.deltaY * 16 : e.deltaY;
   // ctrlKey = trackpad pinch on desktop browsers
   const f = Math.exp(-delta * (e.ctrlKey ? 0.01 : 0.0015));
-  const c = f > 1 ? snapToCurve(p.x, p.y) : p;
-  zoomAt(c.x, c.y, f);
+  if (f > 1) zoomInAt(p.x, p.y, f);
+  else zoomAt(p.x, p.y, f);
 }, { passive: false });
 
 const pointers = new Map<number, { x: number; y: number }>();
@@ -345,9 +363,9 @@ canvas.addEventListener('pointermove', (e) => {
     const mox = (prev.x + other.x) / 2, moy = (prev.y + other.y) / 2;
     const tx = (p.x + other.x) / 2 - mox, ty = (p.y + other.y) / 2 - moy;
     const mag = Math.hypot(kr, ki);
-    const c = mag > 1 ? snapToCurve(mox, moy) : { x: mox, y: moy };
-    if (gesture.rotating) transform(kr, ki, c.x, c.y, c.x + tx, c.y + ty);
-    else transform(mag, 0, c.x, c.y, c.x + tx, c.y + ty);
+    const rr = gesture.rotating ? kr : mag, ri = gesture.rotating ? ki : 0;
+    if (mag > 1) zoomInAt(mox, moy, rr, ri, tx, ty);
+    else transform(rr, ri, mox, moy, mox + tx, moy + ty);
   }
 });
 const endPointer = (e: PointerEvent) => {
@@ -386,7 +404,7 @@ window.addEventListener('keydown', (e) => {
     case 'f': case 'F': fit(); return;
     case 'h': case 'H': document.body.classList.toggle('ui-hidden'); return;
     case 'p': case 'P': exportPNG(); return;
-    case '+': case '=': { const c = snapToCurve(vcx, vcy); zoomAt(c.x, c.y, 1.25); return; }
+    case '+': case '=': zoomInAt(vcx, vcy, 1.25); return;
     case '-': case '_': zoomAt(vcx, vcy, 0.8); return;
     default: return;
   }
@@ -538,7 +556,8 @@ function updateHud() {
     `depth ${s.infinite ? '∞' : s.depth.toFixed(2)}`,
     Math.abs(logZoom) > 0.05 ? `zoom ×${fmtZoom(logZoom)}` : '',
     `${Number.isFinite(stats.segments) ? stats.segments.toLocaleString() : '∞'} segments`,
-    `drawing ${built.segCount.toLocaleString()} (level ${built.deepest})`,
+    built.segCount ? `drawing ${built.segCount.toLocaleString()} (level ${built.deepest})` : 'curve off-screen',
+    built.lodScale > 1.05 ? `detail ÷${built.lodScale.toFixed(1)}` : '',
     `perimeter ×${Number.isFinite(stats.perimeter) ? stats.perimeter.toFixed(3) : '∞'}`,
     Number.isFinite(stats.area) ? `area ×${stats.area.toFixed(3)}` : '',
     `build ${built.ms.toFixed(1)}ms`,
@@ -568,7 +587,10 @@ function tick(now: number) {
   }
   if (s.spin) rotateAbout(vcx, vcy, s.spin * DEG * dt);
   if (s.autoZoom) {
-    zoomAt(vcx, vcy, 2 ** (s.autoZoom * dt));
+    const f = 2 ** (s.autoZoom * dt);
+    // curve off-screen: zoomInAt pulls it back; otherwise zoom on the centre and steer below
+    if (f > 1 && s.follow && built && !built.nearest) zoomInAt(vcx, vcy, f);
+    else zoomAt(vcx, vcy, f);
     if (s.follow && built?.nearest) {
       const k = Math.min(1, 2.5 * dt);
       pan((vcx - built.nearest[0]) * k, (vcy - built.nearest[1]) * k);
@@ -583,6 +605,7 @@ function tick(now: number) {
     panel.sync();
   }
 
+  if (built?.refine) geomDirty = true; // detail budget still settling
   if (dirty || geomDirty) {
     draw();
     dirty = false;
@@ -622,6 +645,6 @@ requestAnimationFrame(tick);
 // Dev-only hook for automated testing (stripped from production builds).
 if (import.meta.env.DEV) {
   Object.assign(window, {
-    __koch: { zoomAt, pan, fit, snapToCurve, viewArea, get built() { return built; }, get cam() { return cam; }, get logZoom() { return logZoom; }, draw },
+    __koch: { zoomAt, zoomInAt, pan, fit, zoomPivot, viewArea, get built() { return built; }, get cam() { return cam; }, get logZoom() { return logZoom; }, draw },
   });
 }

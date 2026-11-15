@@ -431,14 +431,35 @@ export interface BuildResult {
   nearest: [number, number] | null;
   fillCenter: [number, number];
   fillRadius: number;
+  /** How much the detail cutoff was coarsened to stay within the segment budget (1 = as requested). */
+  lodScale: number;
+  /** A finer cutoff may fit: rebuild next frame even if the view is unchanged. */
+  refine: boolean;
   ms: number;
 }
 
+/** Hard cap: past this, remaining segments are emitted unrefined. */
 const BUDGET = 2_000_000;
+/**
+ * Soft cap. Near-space-filling shapes would emit millions of sub-pixel segments
+ * that add nothing visible, so the detail cutoff is coarsened until a build
+ * fits (see `lodScale`).
+ */
+const SOFT_BUDGET = 200_000;
 
 export class Builder {
   private seg = new Float32Array(8 * 65536);
   private tri = new Float32Array(6 * 65536);
+  /** Multiplier on the requested detail cutoff, carried between frames. */
+  private lodScale = 1;
+  /** Builds to wait before trying a finer cutoff again. */
+  private cooldown = 0;
+  /** Cutoff multiplier that last worked, while a finer one is being tried (0 = no trial). */
+  private trialFrom = 0;
+  /** A finer cutoff already failed for this exact view: stop trying until it changes. */
+  private settled = false;
+  private lastShape: Shape | null = null;
+  private viewKey = '';
 
   build(sh: Shape, cam: Frame, o: BuildOptions): BuildResult {
     const t0 = performance.now();
@@ -502,8 +523,12 @@ export class Builder {
     let nearD = Infinity, nearX = 0, nearY = 0;
     const vcx = o.vcx * dpr, vcy = o.vcy * dpr;
     const { lo, hi, ux, hf, rho } = sh;
-    const maxLevel = o.maxLevel, lod = o.lodPx, mt = o.t, pad = o.pad;
+    const maxLevel = o.maxLevel, mt = o.t, pad = o.pad;
     const bigCap = 40 * dpr;
+    let lod = o.lodPx * this.lodScale;
+    /** Give up on a pass once it emits this many segments. */
+    let abortAt = Infinity;
+    let over = false;
 
     const growSeg = () => {
       const n = new Float32Array(this.seg.length * 2);
@@ -573,6 +598,8 @@ export class Builder {
 
     const fill = o.fill && sh.closed;
     const visit = (ar: number, ai: number, br: number, bi: number, k: number, u: number, d: number) => {
+      if (over) return;
+      if (segN >= abortAt) { over = true; return; }
       const len = Math.hypot(ar, ai);
       const rad = len * rho + pad;
       const cx = br + ar * 0.5, cy = bi + ai * 0.5;
@@ -607,8 +634,9 @@ export class Builder {
     };
 
     // base polygon for the fill (even-odd parity of everything above the chain level)
+    const basePts: number[] = [];
     if (fill && sh.nSeed >= 3) {
-      const pts: number[] = [];
+      const pts = basePts;
       for (const f of chain) pts.push(f.br * dpr, f.bi * dpr);
       if (!whole) {
         const last = chain[chain.length - 1];
@@ -621,11 +649,54 @@ export class Builder {
         const far = 4 * (dl + Math.hypot(o.width, o.height));
         pts.push((pts[0] + ex) / 2 - (dy / dl) * far, (pts[1] + ey) / 2 + (dx / dl) * far);
       }
-      pushPoly(pts);
     }
 
     const lvl0 = levelOf(chain[0]);
-    chain.forEach((f, i) => visit(f.ar * dpr, f.ai * dpr, f.br * dpr, f.bi * dpr, lvl0, u0 + i * du, du));
+    const base = o.lodPx;
+    const viewKey = [cam.addr.length, cam.ar, cam.ai, cam.br, cam.bi, o.width, o.height, o.lodPx, o.maxLevel, o.t, o.fill].join();
+    const sameView = sh === this.lastShape && viewKey === this.viewKey;
+    this.lastShape = sh;
+    this.viewKey = viewKey;
+    if (!sameView) this.settled = false;
+    const trial = this.trialFrom; // > 0: this build tries a finer cutoff than the last one that worked
+    this.trialFrom = 0;
+    let refine = false;
+    for (let pass = 0; ; pass++) {
+      const last = pass >= 6;
+      segN = 0; triN = 0; deepest = 0; capped = 0; nearD = Infinity; over = false;
+      abortAt = last ? Infinity : 2 * SOFT_BUDGET;
+      if (basePts.length) pushPoly(basePts);
+      chain.forEach((f, i) => visit(f.ar * dpr, f.ai * dpr, f.br * dpr, f.bi * dpr, lvl0, u0 + i * du, du));
+      if (last) break;
+      const scale = lod / base;
+      if (over) {
+        // Far too many: go back to the cutoff that worked (failed trial) or coarsen, and retry.
+        if (pass === 0 && trial > scale) {
+          lod = base * trial;
+          if (sameView) this.settled = true;
+        } else lod *= 2;
+        this.cooldown = 30;
+        continue;
+      }
+      if (segN > SOFT_BUDGET) {
+        // Acceptable for this frame; coarsen the next one.
+        this.lodScale = scale * Math.max(1.2, Math.sqrt(segN / SOFT_BUDGET));
+        this.cooldown = 30;
+      } else {
+        this.lodScale = scale;
+        // Headroom for finer detail? Segment count can jump ~4x at once (a whole level
+        // subdividing), so only try with plenty of room, and not right after a failure.
+        if (scale > 1 && segN < 0.2 * SOFT_BUDGET && !this.settled) {
+          refine = true;
+          if (this.cooldown > 0) this.cooldown--;
+          else {
+            this.trialFrom = scale;
+            this.lodScale = Math.max(1, scale * Math.sqrt((4 * segN + 1) / (0.9 * SOFT_BUDGET)));
+          }
+        }
+      }
+      break;
+    }
 
     // radial fill gradient: world origin → screen, via the seed frame
     const sf = cloneFrame(cam);
@@ -651,6 +722,8 @@ export class Builder {
       nearest: nearD < Infinity ? [nearX / dpr, nearY / dpr] : null,
       fillCenter: [fcx, fcy],
       fillRadius: frad,
+      lodScale: lod / base,
+      refine,
       ms: performance.now() - t0,
     };
   }
